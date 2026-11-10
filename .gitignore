@@ -1,0 +1,10 @@
+data/
+results/
+*.pgen
+*.pvar
+*.psam
+*.csv
+*.tsv
+*.parquet
+.ipynb_checkpoints/
+__pycache__/
