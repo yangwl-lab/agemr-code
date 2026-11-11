@@ -35,12 +35,12 @@ def validate():
     exec(compile(ast.Module(body=functions, type_ignores=[]), '<setup helpers>', 'exec'), g)
     g.update(SEED=20261028, MIN_ROLE_N=100, AGE_BIN_YEARS=5,
              N_TARGET_REQUESTED=700, N_SOURCE_REQUESTED=700, N_REPEATS=3,
-             N_BOOT=400, IV_P_THRESHOLD=5e-8, MAX_UNION_IV=128, THREADS=1,
+             N_BOOT=400, IV_P_THRESHOLD=1e-5, MAX_UNION_IV=128, THREADS=1,
              MEMORY_MB=1024, UNRELATED_KEEP=None, PLINK='synthetic-adapter', PLINK_VERSION='synthetic adapter',
-             METHODS=('IVW', 'weighted_median', 'MR_Egger'), OUTCOMES=('SBP', 'DBP'),
+             METHODS=('IVW', 'dIVW', 'weighted_median', 'MR_Egger'), OUTCOMES=('SBP', 'DBP'),
              SCENARIOS=[('matched', 0.), ('younger_moderate', -.5), ('younger_strong', -1.),
                         ('older_moderate', .5), ('older_strong', 1.)],
-             KEY=['#CHROM', 'POS', 'ID', 'REF', 'ALT'], CONTRAST_FAMILY=24)
+             KEY=['#CHROM', 'POS', 'ID', 'REF', 'ALT'], CONTRAST_FAMILY=32)
     rng = np.random.default_rng(702)
     n, k = 6500, 7
     ids = pd.Index([f'i{i:05d}' for i in range(n)], name='IID')
@@ -134,9 +134,9 @@ def validate():
             assert set(s['iv_ids']) == set(x.loc[x.P.lt(g['IV_P_THRESHOLD']) & x.valid_GWAS, 'ID'])
         # Boundary checks: strict P, invalid P, errors and no implicit F threshold.
         boundary = g['source_gwas'][g['source_sets'][0]['sid']].iloc[:4].copy()
-        boundary['ERRCODE'] = '.'; boundary['P'] = [5e-8, 0., np.nan, 1e-12]
+        boundary['ERRCODE'] = '.'; boundary['P'] = [1e-5, 1e-6, np.nan, 1e-12]
         boundary['F_classic'] = 0.; boundary.iloc[3, boundary.columns.get_loc('ERRCODE')] = 'ERR'
-        _, chosen = g['select_source_instruments'](boundary, 5e-8)
+        _, chosen = g['select_source_instruments'](boundary, g['IV_P_THRESHOLD'])
         assert chosen.tolist() == [False, True, False, False]
         exec(compile(code[7], '<associations>', 'exec'), g)
         a = next(a for a in g['source_assoc'] if 's1' in set(a.ID))
@@ -167,8 +167,8 @@ def validate():
             column_indices.append(int(g['offsets'][j])+loc)
         assert np.isclose(covariance[tuple(column_indices)], vectors[0]@vectors[1], rtol=1e-7)
         exec(compile(code[9], '<MR>', 'exec'), g)
-        mr = g['mr']; assert len(mr) == 2*15*3
-        assert g['contrasts'].repeat.eq('mean').sum() == 24
+        mr = g['mr']; assert len(mr) == 2*15*4
+        assert g['contrasts'].repeat.eq('mean').sum() == 32
         assert (pd.read_csv(out/'qc/target_harmonization.tsv', sep='\t').N_invalid_target > 0).any()
         # Direct check of point estimates with each source's actual selected set.
         for s, a in zip(g['source_sets'], g['source_assoc']):
@@ -180,14 +180,31 @@ def validate():
             expected = np.sum(xx*yy/sy**2)/np.sum(xx**2/sy**2)
             actual = mr.loc[mr.sid.eq(s['sid']) & mr.outcome.eq('SBP') & mr.method.eq('IVW'), 'estimate'].iloc[0]
             assert np.isclose(actual, expected)
+            sx = a.SE_classic.to_numpy()[ok]
+            weights = sy**-2
+            denominator = np.dot(weights, xx**2 - sx**2)
+            expected_divw = np.dot(weights, xx*yy)/denominator
+            expected_se = np.sqrt(np.dot(weights, xx**2) + expected_divw**2 *
+                                  np.dot(weights**2, sx**2*(xx**2+sx**2)))/denominator
+            divw = mr.loc[mr.sid.eq(s['sid']) & mr.outcome.eq('SBP') & mr.method.eq('dIVW')].iloc[0]
+            assert np.isclose(divw.estimate, expected_divw)
+            assert np.isclose(divw.SE_conventional, expected_se)
         # Empty/one/two/three SNPs and empty covariance must have explicit outcomes.
         for count in (0, 1, 2, 3):
             rows, _ = g['conventional_mr'](np.arange(1, count+1.), np.ones(count)*.1,
                                           np.arange(1, count+1.)*.5, np.ones(count)*.2)
             assert np.isfinite(rows['IVW']['estimate']) == (count > 0)
+            assert np.isfinite(rows['dIVW']['estimate']) == (count > 0)
             assert np.isfinite(rows['weighted_median']['estimate']) == (count >= 3)
             assert np.isfinite(rows['MR_Egger']['estimate']) == (count >= 3)
         assert g['covariance_root'](np.empty((0, 0))).shape == (0, 0)
+        weak_rows, _ = g['conventional_mr'](np.array([.1]), np.array([.1]),
+                                             np.array([.2]), np.array([.1]))
+        assert weak_rows['dIVW']['status'] == 'unstable_dIVW_denominator'
+        assert np.isnan(weak_rows['dIVW']['estimate'])
+        draws = g['mr_points'](np.array([[.2], [.05]]), np.array([[.1], [.1]]),
+                              np.array([.2]), np.array([.1]))
+        assert np.isclose(draws['dIVW'][0], 2/3) and np.isnan(draws['dIVW'][1])
         # A no-hit source alongside available sources must not shift covariance offsets.
         def one_no_hit(command, prefix):
             adapter(command, prefix)
@@ -216,7 +233,7 @@ def validate():
         assert g['mean_mr'].estimate_mean_repeats.isna().all()
         assert not any('--clump' in command for command in commands)
     print('PASS: synthetic 15-source/2-outcome workflow, variable P-selected IVs, fixed target, ALT flips,')
-    print('missing genotypes, target-invalid SNPs, independent OLS/HC1 and IVW checks, covariance,')
+    print('missing genotypes, target-invalid SNPs, independent OLS/HC1, IVW and dIVW checks, covariance,')
     print('strict P threshold, 0/1/2/3 tools, and full no-hit workflow. Real PLINK/AoU not executed.')
 
 
